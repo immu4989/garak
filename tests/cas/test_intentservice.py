@@ -3,6 +3,7 @@
 
 import importlib
 import inspect
+import random
 import nltk
 import pytest
 
@@ -19,6 +20,33 @@ def test_load_intentservice():
 
     garak._config.load_config()
     garak.services.intentservice.load()
+
+
+def test_shared_stub_order_is_seeded_and_isolated(loaded_intent_service, monkeypatch):
+    import garak.services.intentservice as intentservice
+
+    stub_keys = [f"stub:{idx}" for idx in range(20)]
+    random.seed(17)
+    state_before = random.getstate()
+
+    first = intentservice.get_shared_stub_order("S003", stub_keys, seed=42)
+    repeated = intentservice.get_shared_stub_order("S003", stub_keys, seed=42)
+    other_seed = intentservice.get_shared_stub_order("S003", stub_keys, seed=43)
+
+    assert first == repeated, "the same seed must reproduce shared stub ordering"
+    assert first != other_seed, "different seeds should vary shared stub ordering"
+    assert (
+        random.getstate() == state_before
+    ), "shared stub ordering must not consume the global random stream"
+
+    monkeypatch.setattr(garak._config.transient, "run_id", "run-one")
+    first_run = intentservice.get_shared_stub_order("S003", stub_keys)
+    repeated_run = intentservice.get_shared_stub_order("S003", stub_keys)
+    monkeypatch.setattr(garak._config.transient, "run_id", "run-two")
+    second_run = intentservice.get_shared_stub_order("S003", stub_keys)
+
+    assert first_run == repeated_run, "one run must share one source ordering"
+    assert first_run != second_run, "unseeded runs should vary source ordering"
 
 
 def test_intentservice_reject_load():

@@ -136,6 +136,7 @@ Run Config Items
 * ``target_lang`` - A single language (as BCP47 that the target application for LLM accepts as prompt and output
 * ``langproviders`` - A list of configurations representing providers for converting from probe language to lang_spec target languages (BCP47)
 * ``serve_detectorless_intents`` - Should the intent service provide intents for which there are no configured detectors?
+* ``share_intent_stubs`` - Should intent probes reuse the same source stub selection within a run?
 
 Plugins Config Items
 """"""""""""""""""""

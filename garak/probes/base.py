@@ -850,7 +850,9 @@ class IntentProbe(Probe):
 
     DEFAULT_PARAMS = Probe.DEFAULT_PARAMS | {
         "follow_prompt_cap": True,
+        "share_intent_stubs": False,
     }
+    _run_params = Probe._run_params | {"share_intent_stubs"}
 
     intent = None  # IntentProbe subclasses span many typology entries by design, so there is no single best fit.
     skip_root_intents = True
@@ -892,16 +894,72 @@ class IntentProbe(Probe):
         remainder = cap % num_intents
 
         ids_to_keep = set()
+        selection_rng = self._selection_rng()
         for intent_idx, indices in enumerate(prompts_by_intent.values()):
             target = target_per_intent + (1 if intent_idx < remainder else 0)
-            ids_to_keep.update(random.sample(indices, min(target, len(indices))))
+            target = min(target, len(indices))
+            if self.share_intent_stubs:
+                intent_key = self.prompt_intents[indices[0]]
+                ids_to_keep.update(self._shared_prompt_ids(intent_key, indices, target))
+            else:
+                ids_to_keep.update(selection_rng.sample(indices, target))
 
         ids_to_delete = sorted(
             set(range(len(self.prompts))) - ids_to_keep, reverse=True
         )
+        prompt_source_keys = getattr(self, "_prompt_stub_source_keys", [])
+        source_keys_are_aligned = len(prompt_source_keys) == len(self.prompts)
         for idx in ids_to_delete:
             del self.prompts[idx]
             del self.prompt_intents[idx]
+            if source_keys_are_aligned:
+                del self._prompt_stub_source_keys[idx]
+
+    def _selection_rng(self) -> random.Random:
+        """Return an isolated RNG for this probe's prompt selection."""
+
+        seed = getattr(self, "seed", None)
+        if seed is None:
+            return random.Random()
+        return random.Random(f"{seed}\0{self.probename}")
+
+    def _shared_prompt_ids(self, intent_key, indices, target) -> set[int]:
+        """Select prompts while sharing source stub order across probes."""
+
+        if target == 0:
+            return set()
+
+        prompt_source_keys = getattr(self, "_prompt_stub_source_keys", [])
+        if len(prompt_source_keys) == len(self.prompts):
+            source_keys = prompt_source_keys
+        else:
+            source_keys = [
+                json.dumps(["prompt", repr(prompt)], ensure_ascii=False)
+                for prompt in self.prompts
+            ]
+
+        indices_by_source = {}
+        for idx in indices:
+            indices_by_source.setdefault(source_keys[idx], []).append(idx)
+
+        source_order = garak.services.intentservice.get_shared_stub_order(
+            repr(intent_key), indices_by_source, seed=getattr(self, "seed", None)
+        )
+        selected = set()
+        variant_idx = 0
+        while len(selected) < target:
+            added = False
+            for source_key in source_order:
+                source_indices = indices_by_source[source_key]
+                if variant_idx < len(source_indices):
+                    selected.add(source_indices[variant_idx])
+                    added = True
+                    if len(selected) == target:
+                        return selected
+            if not added:
+                break
+            variant_idx += 1
+        return selected
 
     def _populate_intents(self) -> None:
         # work out which intents this probe will process
@@ -915,15 +973,33 @@ class IntentProbe(Probe):
 
         self.stubs: List[Stub] = []  # stubs to be used in prompt construction
         self.stub_intents = []  # list of intent sources aligned w/ self.stubs
+        self._stub_source_keys = []
 
-        for intent in self.intents:
+        for intent in sorted(self.intents):
             if self.skip_root_intents and len(intent) == 1:
                 continue
             intent_stubs = garak.services.intentservice.get_intent_stubs(intent)
-            for intent_stub in intent_stubs:
+            for intent_stub in sorted(intent_stubs, key=self._stub_source_key):
+                source_key = self._stub_source_key(intent_stub)
                 expanded_stubs = self._expand_stub(intent_stub)
+                if isinstance(expanded_stubs, set):
+                    expanded_stubs = sorted(expanded_stubs, key=self._stub_source_key)
                 self.stubs.extend(expanded_stubs)
                 self.stub_intents.extend([intent] * len(expanded_stubs))
+                self._stub_source_keys.extend([source_key] * len(expanded_stubs))
+
+    @staticmethod
+    def _stub_source_key(stub: Stub) -> str:
+        """Return a stable identity for a source stub."""
+
+        return json.dumps(
+            [
+                f"{stub.__class__.__module__}.{stub.__class__.__qualname__}",
+                stub.intent,
+                repr(stub.content),
+            ],
+            ensure_ascii=False,
+        )
 
     def _expand_stub(self, stub: Stub) -> Set[Stub] | List[Stub]:
         """Stubwise-expansion, stubs 1:*"""
@@ -939,15 +1015,24 @@ class IntentProbe(Probe):
         """In the most basic case, consume self.stubs and populate self.prompts"""
         self.prompts = []
         self.prompt_intents = []
+        self._prompt_stub_source_keys = []
         for i, stub in enumerate(self.stubs):
             prompts = self._prompts_from_stub(stub)
             self.prompts.extend(prompts)
             self.prompt_intents.extend([self.stub_intents[i]] * len(prompts))
+            source_key = (
+                self._stub_source_keys[i]
+                if i < len(self._stub_source_keys)
+                else self._stub_source_key(stub)
+            )
+            self._prompt_stub_source_keys.extend([source_key] * len(prompts))
 
     def probe(self, generator) -> Iterable[garak.attempt.Attempt]:
         if not self.prompts:
             # an empty active-intent set (run.spec intent: filtered to nothing)
             # yields no prompts; no-op so the rest of the run proceeds (3A)
-            logging.debug("%s has no active intents; no prompts to send", self.probename)
+            logging.debug(
+                "%s has no active intents; no prompts to send", self.probename
+            )
             return []
         return super().probe(generator)

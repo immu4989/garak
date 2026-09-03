@@ -7,6 +7,8 @@ from collections import Counter
 import garak._config
 import garak._plugins
 import garak.services.intentservice
+from garak.intents import TextStub
+from garak.probes.base import IntentProbe
 
 
 def _load_base_intentprobe():
@@ -20,6 +22,23 @@ def _seed_distribution(probe, prompt_intents):
     """Replace probe prompts/prompt_intents with a controlled distribution."""
     probe.prompts = [f"p{idx}" for idx in range(len(prompt_intents))]
     probe.prompt_intents = list(prompt_intents)
+
+
+def _prunable_probe(name, seed, share_intent_stubs, prompt_prefix, variants=1):
+    """Build an IntentProbe instance with controlled prompt source identities."""
+    probe = object.__new__(IntentProbe)
+    probe.probename = name
+    probe.seed = seed
+    probe.share_intent_stubs = share_intent_stubs
+    probe.prompts = []
+    probe.prompt_intents = []
+    probe._prompt_stub_source_keys = []
+    for source_idx in range(20):
+        for variant_idx in range(variants):
+            probe.prompts.append(f"{prompt_prefix}:{source_idx}:{variant_idx}")
+            probe.prompt_intents.append("A")
+            probe._prompt_stub_source_keys.append(f"source:{source_idx}")
+    return probe
 
 
 def test_intentprobe_load():
@@ -140,3 +159,80 @@ def test_grandmaintent_init_prunes_balanced():
     assert (
         max(counts.values()) - min(counts.values()) <= 1
     ), "GrandmaIntent prompts must be balanced within one per intent"
+
+
+def test_intentprobe_population_order_is_stable(monkeypatch):
+    probe = object.__new__(IntentProbe)
+    probe.intents = {"S002", "S001"}
+    probe.skip_root_intents = False
+
+    monkeypatch.setattr(
+        garak.services.intentservice,
+        "get_intent_stubs",
+        lambda intent: {
+            TextStub(intent, "second"),
+            TextStub(intent, "first"),
+        },
+    )
+
+    probe._populate_stubs()
+
+    assert probe.stub_intents == [
+        "S001",
+        "S001",
+        "S002",
+        "S002",
+    ], "intent stubs must be grouped in stable intent order"
+    assert [stub.content for stub in probe.stubs] == [
+        "first",
+        "second",
+        "first",
+        "second",
+    ], "stubs within each intent must have stable ordering"
+
+
+def test_intentprobe_seed_reproduces_independent_selection():
+    first = _prunable_probe("technique.One", 42, False, "one")
+    repeated = _prunable_probe("technique.One", 42, False, "one")
+    other_technique = _prunable_probe("technique.Two", 42, False, "two")
+
+    first._prune_data(6)
+    repeated._prune_data(6)
+    other_technique._prune_data(6)
+
+    assert (
+        first._prompt_stub_source_keys == repeated._prompt_stub_source_keys
+    ), "the same seed and probe must reproduce source selection"
+    assert set(first._prompt_stub_source_keys) != set(
+        other_technique._prompt_stub_source_keys
+    ), "independent probe selection must remain technique specific"
+
+
+def test_intentprobe_selection_does_not_mutate_global_random_state():
+    probe = _prunable_probe("technique.One", 42, False, "one")
+    random.seed(17)
+    state_before = random.getstate()
+
+    probe._prune_data(6)
+
+    assert (
+        random.getstate() == state_before
+    ), "IntentProbe pruning must not consume the global random stream"
+
+
+def test_intentprobe_shared_selection_uses_same_sources(loaded_intent_service):
+    first = _prunable_probe("technique.One", 42, True, "one", variants=3)
+    second = _prunable_probe("technique.Two", 42, True, "two", variants=2)
+
+    first._prune_data(6)
+    second._prune_data(6)
+
+    assert set(first._prompt_stub_source_keys) == set(
+        second._prompt_stub_source_keys
+    ), "shared selection must keep the same source stubs across techniques"
+    assert (
+        len(set(first._prompt_stub_source_keys)) == 6
+    ), "shared selection must cover source stubs before extra variants"
+    assert len(first._prompt_stub_source_keys) == len(
+        first.prompts
+    ), "source keys must stay aligned with retained prompts"

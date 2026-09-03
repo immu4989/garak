@@ -166,6 +166,8 @@ in full in :doc:`configurable`:
 
 * ``run.serve_detectorless_intents`` -- whether to include intents that have no
   mapped detector.
+* ``run.share_intent_stubs`` -- whether intent probes should use the same
+  source stub selection within a run. This is disabled unless explicitly set.
 
 When no ``intent:`` selector is given, the default scope ``S`` is injected at
 resolve time; override it with ``run.spec`` ``intent:`` selectors.

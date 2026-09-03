@@ -30,6 +30,9 @@ To check the quality of the intents present in the system, see ``tools.cas.inten
 import importlib
 import json
 import logging
+import random
+import secrets
+from collections.abc import Iterable
 from typing import List, Set
 import yaml
 
@@ -46,6 +49,8 @@ is_loaded = False
 intent_typology = {}
 intent_detectors = {}
 intents_active = set()
+_shared_stub_priorities: dict[tuple[str, str, str], float] = {}
+_shared_stub_selection_nonce = secrets.token_hex(16)
 
 INTENT_PREFIX = "🎯"
 
@@ -184,7 +189,9 @@ def load():
     stashed on ``_config.transient`` by the CLI. When that is absent (e.g. a
     direct service load that did not resolve a spec), fall back to
     :data:`garak._spec.DEFAULT_INTENT_SCOPE`."""
-    global is_loaded
+    global is_loaded, _shared_stub_priorities, _shared_stub_selection_nonce
+    _shared_stub_priorities = {}
+    _shared_stub_selection_nonce = secrets.token_hex(16)
     _load_intent_typology()
     _load_intent_detector_mapping()
     intent_spec = getattr(garak._config.transient, "intent_spec", None)
@@ -193,6 +200,31 @@ def load():
         intent_spec = DEFAULT_INTENT_SCOPE
     _populate_intents(intent_spec, blocked_spec or "")
     is_loaded = True
+
+
+def get_shared_stub_order(
+    intent_code: str, stub_keys: Iterable[str], seed: int | None = None
+) -> tuple[str, ...]:
+    """Return a run-scoped, deterministic ordering of source stub keys."""
+
+    if not is_loaded:
+        raise GarakException("get_shared_stub_order called on non-loaded intentservice")
+
+    run_id = getattr(garak._config.transient, "run_id", None)
+    scope = (
+        f"seed:{seed}"
+        if seed is not None
+        else f"run:{run_id or _shared_stub_selection_nonce}"
+    )
+
+    def priority(stub_key: str) -> float:
+        cache_key = (scope, intent_code, stub_key)
+        if cache_key not in _shared_stub_priorities:
+            priority_rng = random.Random(json.dumps(cache_key, ensure_ascii=False))
+            _shared_stub_priorities[cache_key] = priority_rng.random()
+        return _shared_stub_priorities[cache_key]
+
+    return tuple(sorted(set(stub_keys), key=lambda key: (priority(key), key)))
 
 
 def _get_stubs_typology(intent_code: str) -> Set[Stub]:
